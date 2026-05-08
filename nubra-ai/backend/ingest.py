@@ -15,8 +15,8 @@ load_dotenv()
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 METADATA_MODEL = "gpt-4o"  # Use gpt-4o for reliable JSON extraction
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+CHUNK_SIZE = 300
+CHUNK_OVERLAP = 30
 
 UNKNOWN_METADATA = {
     "company_ticker": "UNKNOWN",
@@ -200,8 +200,13 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
         page_texts = []
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
             total_pages = len(pdf.pages)
-            for page in pdf.pages:
-                page_texts.append((page.extract_text() or "").strip())
+            for i, page in enumerate(pdf.pages):
+                page_text = (page.extract_text() or "").strip()
+                page_texts.append(page_text)
+                # Clean up page object to free memory after processing
+                if i % 10 == 0:
+                    import gc
+                    gc.collect()
 
         first_3_pages_text = "\n\n".join(page_texts[:3])
         metadata = extract_metadata_from_pdf(first_3_pages_text)
@@ -252,7 +257,7 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                     "created_at": utc_now(),
                 })
 
-        batch_size = 500
+        batch_size = 100
         for i in range(0, len(all_chunks), batch_size):
             batch = all_chunks[i : i + batch_size]
             texts = [c["chunk_text"] for c in batch]
