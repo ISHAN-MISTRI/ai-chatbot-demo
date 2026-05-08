@@ -4,3 +4,7 @@
 .venv-1
 __pycache__/
 */pdfs/
+node_modules/
+nubra-ai/frontend/node_modules/
+.vite/
+dist/
