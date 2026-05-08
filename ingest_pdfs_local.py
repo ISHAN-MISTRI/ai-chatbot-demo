@@ -18,16 +18,25 @@ from openai import OpenAI
 from pymongo import MongoClient
 from datetime import datetime, timezone
 
-# Load environment variables
+# Load environment variables from .env file, but allow command-line overrides
 load_dotenv(dotenv_path="/vercel/share/v0-project/nubra-ai/backend/.env")
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHUNK_SIZE = 300
 CHUNK_OVERLAP = 30
 
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/nubra_ai")
+# Prioritize environment variables (command-line or system env)
+MONGODB_URI = os.getenv("MONGODB_URI")
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "nubra_ai")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Validate required env vars
+if not MONGODB_URI:
+    print("[ERROR] MONGODB_URI environment variable is not set!")
+    sys.exit(1)
+if not OPENAI_API_KEY:
+    print("[ERROR] OPENAI_API_KEY environment variable is not set!")
+    sys.exit(1)
 
 # Initialize clients
 client_openai = OpenAI(api_key=OPENAI_API_KEY)
