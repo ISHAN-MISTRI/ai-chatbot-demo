@@ -85,8 +85,13 @@ export default function UploadModal({
                     </div>
                     {status.done ? (
                       <div className="mt-2 text-[12px] text-emerald-600">
-                        ✓ {file.name} — {status.ticker || "UNKNOWN"} {status.quarter || "UNKNOWN"} —{" "}
-                        {status.totalChunks || 0} chunks stored
+                        ✓ {file.name} — {status.ticker || "UNKNOWN"}{" "}
+                        {status.quarter
+                          ? status.quarter.startsWith("Q")
+                            ? status.quarter
+                            : `${status.quarter} (Annual)`
+                          : "UNKNOWN"}{" "}
+                        — {status.totalChunks || 0} chunks stored
                       </div>
                     ) : null}
                   </div>

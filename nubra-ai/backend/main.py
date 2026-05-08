@@ -21,44 +21,63 @@ You are an elite financial research assistant for Indian stock market investors 
 You have TWO modes of answering. Always choose the most appropriate one based on the user's question.
 
 =========================================
+SENTIMENT SCORING RULES (apply in BOTH modes)
+=========================================
+To determine Sentiment, score the data objectively:
+  BULLISH signals (+1 each): revenue growth YoY, PAT/profit growth, margin expansion, debt reduction,
+    dividend increase, volume growth, capacity expansion, positive guidance, market share gain.
+  BEARISH signals (-1 each): revenue decline, PAT/profit decline or loss, margin compression,
+    debt increase, impairment/restructuring charge, negative guidance, significant write-off.
+
+Final score → Bullish (net positive), Bearish (net negative), Neutral (exactly balanced or insufficient data).
+NEVER default to Neutral unless the data is genuinely 50/50. Most reports are clearly one direction.
+
+=========================================
 MODE 1: DIRECT Q&A (Specific Questions)
 =========================================
-Use this mode if the user asks a specific, narrow question (e.g., "What is the PAT?", "Compare revenue across quarters", "What are the risks?", "Who are the competitors?").
+Use this mode if the user asks a specific, narrow question (e.g., "What is the PAT?", "Compare revenue", "What are the risks?").
 - Answer ONLY the specific question asked. Do not generate a full report.
-- Begin your response with an accurate Sentiment (e.g., "**Sentiment:** Bullish") based on the data you find. DO NOT default to Neutral.
-- If numeric data is relevant, ALWAYS present it in a clean Markdown table. Create dynamic columns based on the exact data you find.
-- Base your answers strictly on the retrieved report chunks.
-- DO NOT use the "#### Financial Performance" heading or the massive report template.
+- Begin with "**Sentiment:** [Bullish/Bearish/Neutral]" — apply the scoring rules above rigorously.
+- If numeric data is relevant, ALWAYS present it in a clean Markdown table.
+- Base answers strictly on the retrieved report chunks.
 
 =========================================
 MODE 2: FULL REPORT GENERATION
 =========================================
-Use this mode ONLY if the user asks for a summary, a full report, earnings analysis, or a general overview (e.g., "Summarize Q3 2025 earnings", "Give me a report").
+Use this mode if the user asks for a summary, full report, earnings analysis, or general overview.
 
-Respond in EXACTLY this format (do not omit any sections):
+IMPORTANT: If chunks from MULTIPLE years/periods are provided (e.g. FY21, FY22, FY23, FY24, FY25),
+your report MUST cover ALL of them — build a multi-year financial table showing every year as a column.
+Do NOT skip or ignore any period that has data in the context.
 
-➤ [COMPANY_TICKER] – [Report Type] Report ([QuarterYear])
+Respond in EXACTLY this format:
+
+➤ [COMPANY_TICKER] – [Report Type] Report ([Period range, e.g. FY21–FY25])
 
 **Sentiment**
-[Single word: Bullish / Bearish / Neutral - Ensure this accurately reflects the data!]
+[Bullish / Bearish / Neutral — determined by the scoring rules above, NOT by default]
 
 **Positive Highlights**
-- [concise point, max 15 words]
-- [concise point, max 15 words]
-- [concise point, max 15 words]
+- [concise point with year reference, max 15 words]
+- [concise point with year reference, max 15 words]
+- [concise point with year reference, max 15 words]
 
 **Negative Highlights**
-- [concise point, max 15 words]
-- [concise point, max 15 words]
+- [concise point with year reference, max 15 words]
+- [concise point with year reference, max 15 words]
 
 **Summary**
 ### Company Financial Report
 
 #### Financial Performance
-[Create a Markdown table here. DYNAMICALLY generate the columns based on the exact quarters and metrics available in the text. DO NOT leave columns empty. If you only have one quarter of data, only use one column. Include a 'Comments' column at the end.]
+[Markdown table with one column per fiscal year (FY21 / FY22 / FY23 / FY24 / FY25) for every available metric.
+Show actual numbers from the data — do NOT leave cells blank. Add a 'Trend' column at the end summarising direction.]
+
+#### Segment Highlights
+- [bullet points covering business segments (e.g., steel, automotive, infrastructure) with year references]
 
 #### Operational Highlights
-- [bullet points covering volumes, capacity, key segments]
+- [bullet points covering production, utilization, costs, capacity, efficiency metrics — cite year where relevant]
 
 #### Risks and Challenges
 - [bullet points]
@@ -67,10 +86,10 @@ Respond in EXACTLY this format (do not omit any sections):
 - [bullet points on growth drivers, plans]
 
 #### Conclusion
-[2-3 sentences on overall performance]
+[2-3 sentences summarising the multi-year trajectory]
 
 #### References
-1. [COMPANY_TICKER] – [Report Name]. [Link]
+1. [COMPANY_TICKER] – [Report Name]
 
 *Disclaimer: This real-time financial synthesis was dynamically generated by SIHL using proprietary vector analysis of corporate filings. Not financial advice.*
 
@@ -78,6 +97,7 @@ STRICT RULES FOR MODE 2:
 1. Use ₹ for all Indian currency values
 2. Sentiment must be exactly ONE word: Bullish, Bearish, or Neutral
 3. Never add, rename, or remove any section in Mode 2
+4. If multi-year data is in context, the financial table MUST have all those years as columns
 """.strip()
 
 app = FastAPI(title="SIHL API", version="2.0.0")
@@ -111,6 +131,47 @@ def _serialize_report(doc):
         "uploaded_at": doc.get("uploaded_at"),
         "status": doc.get("status", "unknown"),
     }
+
+
+def _extract_section_snippet(chunk_text: str) -> str:
+    for line in (chunk_text or "").splitlines():
+        cleaned = " ".join(line.strip().split())
+        if len(cleaned) >= 8:
+            return cleaned[:140]
+    return "General financial disclosure"
+
+
+def _build_source_references(chunk_docs: List[dict]) -> List[str]:
+    if not chunk_docs:
+        return []
+
+    _, db = get_database()
+    report_ids = list({doc.get("report_id") for doc in chunk_docs if doc.get("report_id") is not None})
+    report_name_map = {}
+    if report_ids:
+        for report in db.reports.find({"_id": {"$in": report_ids}}, {"original_filename": 1}):
+            report_name_map[report["_id"]] = report.get("original_filename") or "Unknown PDF"
+
+    unique_refs = []
+    seen = set()
+    for doc in chunk_docs:
+        report_id = doc.get("report_id")
+        filename = (
+            doc.get("source_filename")
+            or report_name_map.get(report_id)
+            or "Unknown PDF"
+        )
+        page = doc.get("page_number") or "?"
+        section = _extract_section_snippet(doc.get("chunk_text", ""))
+        key = (filename, page, section)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_refs.append(f"{filename} | Page {page} | Section: {section}")
+        if len(unique_refs) >= 8:
+            break
+
+    return unique_refs
 
 
 @app.post("/api/upload")
@@ -175,6 +236,10 @@ async def chat(request: ChatRequest):
             ],
         )
         response_text = (completion.choices[0].message.content or "").strip()
+        source_refs = _build_source_references(chunk_docs)
+        if source_refs:
+            reference_block = "\n".join(f"{idx}. {ref}" for idx, ref in enumerate(source_refs, start=1))
+            response_text = f"{response_text}\n\n### Source References\n{reference_block}"
         usage = completion.usage
         tokens_used = (usage.prompt_tokens if usage else 0) + (
             usage.completion_tokens if usage else 0
@@ -216,7 +281,14 @@ async def chat(request: ChatRequest):
 
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest):
-    chunks = retrieve_relevant_chunks(request.user_message, request.company_ticker, request.quarters)
+    try:
+        chunks = retrieve_relevant_chunks(request.user_message, request.company_ticker, request.quarters)
+        chunk_docs = retrieve_chunk_documents(request.user_message, request.company_ticker, request.quarters)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    source_refs = _build_source_references(chunk_docs)
     user_prompt = (
         "Here is the extracted financial report data:\n\n"
         f"{chunks}\n\n"
@@ -227,7 +299,8 @@ async def chat_stream(request: ChatRequest):
     def event_stream():
         final_text_parts = []
         stream = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-4o",
+            max_tokens=6000,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
@@ -240,6 +313,10 @@ async def chat_stream(request: ChatRequest):
                 final_text_parts.append(delta)
                 yield f"data: {json.dumps(delta)}\n\n"
         final_text = "".join(final_text_parts).strip()
+        if final_text and source_refs:
+            reference_block = "\n".join(f"{idx}. {ref}" for idx, ref in enumerate(source_refs, start=1))
+            final_text = f"{final_text}\n\n### Source References\n{reference_block}"
+            yield f"data: {json.dumps(f'\n\n### Source References\n{reference_block}')}\n\n"
         if final_text:
             _, db = get_database()
             db.chat_history.insert_many(

@@ -23,7 +23,8 @@ function sentimentInfo(sentiment) {
 }
 
 function parseBlock(block) {
-  const lines = block.split("\n").map((line) => line.trimEnd());
+  const [mainContent, sourceReferencePart = ""] = block.split("\n### Source References\n");
+  const lines = mainContent.split("\n").map((line) => line.trimEnd());
   const title = lines[0] || "";
 
   const between = (start, end) => {
@@ -48,15 +49,17 @@ function parseBlock(block) {
   const summary = between("**Summary**", []);
 
   const tableStart = summary.findIndex((line) => line === "#### Financial Performance");
+  const segmentStart = summary.findIndex((line) => line === "#### Segment Highlights");
   const opStart = summary.findIndex((line) => line === "#### Operational Highlights");
   const riskStart = summary.findIndex((line) => line === "#### Risks and Challenges");
   const outlookStart = summary.findIndex((line) => line === "#### Outlook");
   const conclusionStart = summary.findIndex((line) => line === "#### Conclusion");
   const refStart = summary.findIndex((line) => line === "#### References");
 
+  const tableEnd = segmentStart !== -1 ? segmentStart : opStart;
   const tableLines =
-    tableStart !== -1 && opStart !== -1
-      ? summary.slice(tableStart + 1, opStart).filter((line) => line.startsWith("|"))
+    tableStart !== -1 && tableEnd !== -1
+      ? summary.slice(tableStart + 1, tableEnd).filter((line) => line.startsWith("|"))
       : [];
 
   const headers = tableLines[0]?.split("|").map((item) => item.trim()).filter(Boolean) || [];
@@ -81,6 +84,7 @@ function parseBlock(block) {
     headers,
     rows,
     operational: bulletRange(opStart, riskStart),
+    segments: bulletRange(segmentStart, opStart),
     risks: bulletRange(riskStart, outlookStart),
     outlook: bulletRange(outlookStart, conclusionStart),
     conclusion:
@@ -91,6 +95,10 @@ function parseBlock(block) {
       refStart !== -1
         ? summary.slice(refStart + 1).filter((line) => line && !line.startsWith("*Disclaimer:"))
         : [],
+    sourceReferences: sourceReferencePart
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean),
     disclaimer: summary.find((line) => line.startsWith("*Disclaimer:")) || "",
   };
 }
@@ -192,8 +200,23 @@ export default function ReportOutput({ response }) {
                 </div>
               </div>
 
-              {/* 3-Column Insights */}
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 pt-6 border-t border-slate-100">
+              {/* 4-Column Insights */}
+              <div className="grid grid-cols-1 lg:grid-cols-4 gap-8 pt-6 border-t border-slate-100">
+                <div>
+                  <div className="flex items-center gap-2 mb-4 text-slate-900">
+                    <Target size={16} className="text-teal-500" />
+                    <h3 className="font-bold text-[14px]">Segments</h3>
+                  </div>
+                  <ul className="space-y-3 text-[13px] text-slate-600">
+                    {parsed.segments.map((item, i) => (
+                      <li key={i} className="flex items-start gap-2.5">
+                        <span className="text-teal-400 mt-0.5">•</span>
+                        <span className="leading-relaxed">{item}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
                 <div>
                   <div className="flex items-center gap-2 mb-4 text-slate-900">
                     <Activity size={16} className="text-blue-500" />
@@ -259,6 +282,17 @@ export default function ReportOutput({ response }) {
                 <div className="mt-4 text-[11px] font-medium text-slate-400/80 italic leading-relaxed">
                   {parsed.disclaimer}
                 </div>
+
+                {parsed.sourceReferences.length > 0 && (
+                  <div className="mt-5">
+                    <h3 className="font-bold text-[11px] text-slate-400 uppercase tracking-widest mb-3">Source References</h3>
+                    <div className="space-y-1.5 text-[11.5px] text-slate-600">
+                      {parsed.sourceReferences.map((item) => (
+                        <div key={item}>{item}</div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </div>

@@ -14,7 +14,7 @@ from database import get_database, get_gridfs, utc_now
 load_dotenv()
 
 EMBEDDING_MODEL = "text-embedding-3-small"
-METADATA_MODEL = "gpt-5"
+METADATA_MODEL = "gpt-4o"  # Use gpt-4o for reliable JSON extraction
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 
@@ -26,46 +26,81 @@ UNKNOWN_METADATA = {
     "fiscal_year": "UNKNOWN",
 }
 
+# Annual report types that don't have a quarter — use fiscal year as the period key
+ANNUAL_REPORT_TYPES = {"AnnualReport", "IntegratedReport", "annual", "integrated"}
+
 
 def _clean_upper_alnum(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
 
 
-def _infer_quarter_from_text(raw_text: str) -> str:
-    if not raw_text:
+def _infer_fiscal_year_from_text(text: str) -> str:
+    """Infer fiscal year from patterns like '2024-25', 'FY25', 'FY 2025', '2021-22'."""
+    if not text:
         return "UNKNOWN"
-    match = re.search(r"\bQ([1-4])\s*[- ]?\s*FY\s*([0-9]{2,4})\b", raw_text, flags=re.IGNORECASE)
-    if not match:
-        match = re.search(r"\b([1-4])Q\s*[- ]?\s*FY\s*([0-9]{2,4})\b", raw_text, flags=re.IGNORECASE)
-    if not match:
-        return "UNKNOWN"
-    quarter = match.group(1)
-    year = match.group(2)[-2:]
-    return f"Q{quarter}FY{year}"
-
-
-def _infer_ticker_from_filename(original_filename: str) -> str:
-    stem = os.path.splitext(os.path.basename(original_filename or ""))[0]
-    if not stem:
-        return "UNKNOWN"
-    parts = re.split(r"[_\-\s]+", stem)
-    for part in parts:
-        token = _clean_upper_alnum(part)
-        if 2 <= len(token) <= 12 and not token.startswith("Q") and "FY" not in token:
-            return token
+    # Pattern: FY25 or FY2025
+    m = re.search(r"\bFY\s*(20)?([0-9]{2})\b", text, re.IGNORECASE)
+    if m:
+        return f"FY{m.group(2)}"
+    # Pattern: 2024-25 or 2021-22 (Indian fiscal year notation)
+    m = re.search(r"\b(20[0-9]{2})[-–](2[0-9]|[0-9]{2})\b", text)
+    if m:
+        end_year = m.group(2)[-2:]  # last 2 digits of end year
+        return f"FY{end_year}"
     return "UNKNOWN"
 
 
-def _apply_metadata_fallbacks(metadata: Dict[str, str], first_3_pages_text: str, original_filename: str) -> Dict[str, str]:
+def _infer_quarter_from_text(raw_text: str) -> str:
+    if not raw_text:
+        return "UNKNOWN"
+    match = re.search(r"\bQ([1-4])\s*[- ]?\s*FY\s*(20)?([0-9]{2})\b", raw_text, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"\b([1-4])Q\s*[- ]?\s*FY\s*(20)?([0-9]{2})\b", raw_text, flags=re.IGNORECASE)
+    if not match:
+        return "UNKNOWN"
+    quarter = match.group(1)
+    year = match.group(3) if match.lastindex >= 3 else match.group(2)[-2:]
+    return f"Q{quarter}FY{year[-2:]}"
+
+
+def _apply_metadata_fallbacks(
+    metadata: Dict[str, str], first_3_pages_text: str, original_filename: str
+) -> Dict[str, str]:
+    """Apply fallback inference for missing metadata fields.
+    
+    Key design decisions:
+    - We do NOT infer ticker from filename — it produces junk like 'TATA' or 'TSL' or 'FY25'.
+    - For annual/integrated reports (no quarter), we use the fiscal year as the 'quarter' field
+      so each report has a stable, unique identity key (ticker + fiscal_year_as_quarter).
+    - Fiscal year is inferred from text patterns like '2024-25', 'FY25', etc.
+    """
     text = first_3_pages_text or ""
-    normalized_text = f"{text}\n{original_filename}"
+    combined_text = f"{text}\n{original_filename}"
+
+    report_type = metadata.get("report_type", "UNKNOWN")
+    is_annual = any(t.lower() in report_type.lower() for t in ["annual", "integrated"]) or report_type == "UNKNOWN"
+
+    # Step 1: Try to get fiscal year from text/filename
+    if metadata.get("fiscal_year", "UNKNOWN") == "UNKNOWN":
+        metadata["fiscal_year"] = _infer_fiscal_year_from_text(combined_text)
+
+    # Step 2: For quarterly reports, infer quarter from text
+    if metadata.get("quarter", "UNKNOWN") == "UNKNOWN" and not is_annual:
+        metadata["quarter"] = _infer_quarter_from_text(combined_text)
+        if metadata["quarter"] != "UNKNOWN" and metadata["fiscal_year"] == "UNKNOWN":
+            metadata["fiscal_year"] = metadata["quarter"][-4:]  # e.g. Q3FY25 -> FY25
+
+    # Step 3: For annual/integrated reports without a quarter, use the fiscal year as period key
     if metadata.get("quarter", "UNKNOWN") == "UNKNOWN":
-        metadata["quarter"] = _infer_quarter_from_text(normalized_text)
-    if metadata.get("fiscal_year", "UNKNOWN") == "UNKNOWN" and metadata.get("quarter", "UNKNOWN") != "UNKNOWN":
-        metadata["fiscal_year"] = metadata["quarter"][-4:]
-    if metadata.get("company_ticker", "UNKNOWN") == "UNKNOWN":
-        metadata["company_ticker"] = _infer_ticker_from_filename(original_filename)
-    metadata["company_ticker"] = _clean_upper_alnum(metadata.get("company_ticker", "UNKNOWN")) or "UNKNOWN"
+        fy = metadata.get("fiscal_year", "UNKNOWN")
+        if fy != "UNKNOWN":
+            metadata["quarter"] = fy  # e.g. "FY25" — unique per year
+
+    # Step 4: Normalize the ticker — strip all non-alphanumeric characters
+    # NEVER fall back to filename-based ticker inference (produces wrong values)
+    ticker = _clean_upper_alnum(metadata.get("company_ticker", "UNKNOWN"))
+    metadata["company_ticker"] = ticker if ticker else "UNKNOWN"
+
     return metadata
 
 
@@ -78,17 +113,25 @@ def _openai_client() -> OpenAI:
 
 def extract_metadata_from_pdf(first_3_pages_text: str) -> Dict[str, str]:
     prompt = f"""
-Read the following text extracted from the first 3 pages of an Indian company 
-financial report PDF. Extract and return ONLY a JSON object with these fields:
+Read the following text extracted from the first 3 pages of an Indian company financial report PDF.
+Extract and return ONLY a JSON object with these exact fields:
+
 {{
-  "company_ticker": "NSE ticker symbol in uppercase e.g. TATASTEEL",
-  "company_name": "Full legal company name",
-  "report_type": "One of: InvestorPresentation / AnnualReport / QuarterlyResults",
-  "quarter": "Quarter code e.g. Q3FY25",
-  "fiscal_year": "Fiscal year e.g. FY25"
+  "company_ticker": "The official NSE ticker symbol in uppercase. Extract it from the document text (e.g. TATASTEEL, HDFCBANK, RELIANCE). DO NOT guess from the filename.",
+  "company_name": "Full legal company name as written in the document",
+  "report_type": "One of: InvestorPresentation / AnnualReport / IntegratedReport / QuarterlyResults",
+  "quarter": "For quarterly reports use format like Q3FY25. For Annual/Integrated Reports that cover a full fiscal year, use the fiscal year itself as the period e.g. FY25, FY22. Do NOT leave this blank for annual reports.",
+  "fiscal_year": "Fiscal year in format FY25 (2-digit year suffix). Always fill this."
 }}
-Return ONLY the JSON. No explanation. No markdown. No extra text.
-PDF text: {first_3_pages_text}
+
+IMPORTANT RULES:
+1. The ticker must come from the PDF content (company header, NSE listing, etc.), NOT from any filename or URL.
+2. For Integrated Reports / Annual Reports, the 'quarter' field should be the fiscal year e.g. 'FY25'.
+3. Look for year ranges like '2024-25' or '2021-22' to determine the fiscal year (the end year gives the FY code: 2024-25 = FY25).
+4. Return ONLY valid JSON. No markdown. No explanation.
+
+PDF text:
+{first_3_pages_text}
 """.strip()
 
     try:
