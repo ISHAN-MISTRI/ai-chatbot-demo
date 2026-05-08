@@ -22,7 +22,7 @@ const navItems = [
   { label: "Chart Analyzer", icon: TrendingUp },
   { label: "Portfolio", icon: Briefcase },
   { label: "Orders", icon: FileText },
-  { label: "Nubra AI", icon: Brain, active: true, badge: "Beta" },
+  { label: "SIHL", icon: Brain, active: true, badge: "Beta" },
   { label: "IPO", icon: Star },
   { label: "Alerts", icon: Bell },
 ];
@@ -35,7 +35,7 @@ export default function Sidebar() {
           <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
             <Zap size={18} fill="currentColor" />
           </div>
-          <div className="text-[22px] font-extrabold tracking-tight text-slate-900">Nubra</div>
+          <div className="text-[22px] font-extrabold tracking-tight text-slate-900">SIHL</div>
         </div>
         <button className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600">
           <LayoutPanelLeft size={17} />

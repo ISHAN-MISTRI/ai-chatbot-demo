@@ -20,7 +20,7 @@ export default function UploadModal({
           <div>
             <h2 className="text-[20px] font-bold text-slate-900">Upload financial report</h2>
             <p className="mt-1 text-[13px] text-slate-500">
-              Add a PDF to local MongoDB and start retrieval for Nubra AI.
+              Add a PDF to local MongoDB and start retrieval for SIHL.
             </p>
           </div>
           <button

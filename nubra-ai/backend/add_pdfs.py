@@ -22,10 +22,9 @@ def add_pdfs(pdf_dir: str):
 
     print(f"Found {len(pdf_files)} PDF files. Starting ingestion...")
     
-    # Optional: cleanup failed processing files
-    client, db = get_database()
-    db.report_files.delete_many({"status": "processing"})
-    client.close()
+    # Optional: cleanup stale processing markers without closing shared client
+    _, db = get_database()
+    db.reports.delete_many({"status": "processing"})
 
     for pdf_path in pdf_files:
         filename = os.path.basename(pdf_path)

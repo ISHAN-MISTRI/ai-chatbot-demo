@@ -1,43 +1,54 @@
-# Nubra AI
+# Nubra AI - Production Stock Analysis Chatbot
 
-Nubra AI is a financial report chatbot for Indian stock market investors. It runs with a React frontend, FastAPI backend, local MongoDB with GridFS, and OpenAI for both metadata extraction and final report generation.
+End-to-end dynamic AI platform for stock report analysis:
+- Upload/admin-manage PDF reports
+- Extract report content and metadata into structured JSON
+- Persist report, JSON chunks, embeddings, and chat history in MongoDB
+- Use semantic retrieval + OpenAI generation for context-rich financial answers
+- Premium dark, minimal chat UI with markdown/tables and streaming responses
 
-## Structure
+## Folder Structure
 
 ```text
 nubra-ai/
-├── frontend/
 ├── backend/
-├── mongo_setup.md
-├── test.py
+│   ├── main.py
+│   ├── ingest.py
+│   ├── retrieval.py
+│   ├── database.py
+│   ├── models.py
+│   └── requirements.txt
+├── frontend/
+│   ├── src/pages/NubraAI.jsx
+│   └── package.json
 └── README.md
 ```
 
-## Backend Environment
+## MongoDB Collections
+
+- `reports`: one document per uploaded report (status, ticker, quarter, file pointers)
+- `extracted_json`: structured extracted chunks for downstream analytics
+- `embeddings`: semantic vectors and chunk text for RAG retrieval
+- `chat_history`: user/assistant conversational history by session
+- `users`: auth-ready user collection (email index already created)
+
+## Environment Setup
 
 Create `backend/.env`:
-
 ```env
-MONGODB_URI=mongodb://localhost:27017/nubra_ai
+MONGODB_URI=mongodb://localhost:27017
+MONGODB_DB_NAME=nubra_ai
 OPENAI_API_KEY=your_openai_api_key
 ```
 
-## Frontend Environment
-
 Create `frontend/.env`:
-
 ```env
 VITE_API_URL=http://localhost:8000
 ```
 
-## Local MongoDB
-
-See [mongo_setup.md](./mongo_setup.md) for setup.
-
-## Install
+## Run Locally
 
 Backend:
-
 ```powershell
 cd backend
 py -3.12 -m venv .venv
@@ -47,42 +58,49 @@ uvicorn main:app --reload --port 8000
 ```
 
 Frontend:
-
 ```powershell
 cd frontend
 npm install
 npm run dev
 ```
 
-## Main Endpoints
+## API Routes
 
-- `POST /api/upload`
-- `POST /api/chat`
-- `GET /api/reports`
-- `GET /api/reports/tickers`
-- `GET /api/reports/{ticker}/{quarter}/status`
-- `DELETE /api/reports/{ticker}/{quarter}`
-- `GET /api/chat/history/{session_id}`
-- `GET /api/health`
+- `POST /api/upload` - upload one or more PDF reports
+- `POST /api/chat` - non-streaming RAG answer
+- `POST /api/chat/stream` - SSE streaming RAG answer
+- `GET /api/reports` - list all report ingestions
+- `GET /api/reports/tickers` - available tickers + quarters
+- `GET /api/reports/{ticker}/{quarter}/status` - ingestion status
+- `DELETE /api/reports/{ticker}/{quarter}` - delete report + vectors + extracted data
+- `GET /api/chat/history/{session_id}` - chat history replay
+- `GET /api/health` - health + Mongo connectivity
 
-## Flow
+## Sample Extracted JSON Shape
 
-1. Upload one or more PDFs from the modal.
-2. The backend stores the raw PDF in GridFS.
-3. OpenAI extracts ticker, company, report type, quarter, and fiscal year from the first three pages.
-4. The PDF is chunked and embedded with `text-embedding-3-small`.
-5. Local MongoDB documents are ranked with cosine similarity in Python.
-6. OpenAI formats the final answer using the strict report template.
-
-## Test Script
-
-Run:
-
-```powershell
-python test.py
+```json
+{
+  "report_id": "6640f2c18c...",
+  "chunk_id": "6640f2c18c...:12:3",
+  "company_ticker": "TATASTEEL",
+  "quarter": "Q3FY25",
+  "page_number": 12,
+  "chunk_text": "Consolidated revenue for the quarter was..."
+}
 ```
 
-If you want upload testing, place sample PDFs in `./samples` named:
+## Deployment Guide
 
-- `tatasteel_q3fy25.pdf`
-- `reliance_q2fy25.pdf`
+- Frontend: deploy `frontend` on Vercel (`npm run build`)
+- Backend: deploy `backend` on Render/Railway with start command:
+  - `uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Use managed MongoDB Atlas in production
+- Add CORS allowlist for deployed frontend URL
+- Configure secrets (`OPENAI_API_KEY`, `MONGODB_URI`) in provider environment settings
+
+## Architecture Notes
+
+- Ingestion is async via background tasks to avoid blocking uploads
+- Indexes are auto-created on startup for query speed and uniqueness
+- Embedding retrieval is semantic, dynamic, and fully DB-backed (no static responses)
+- Chat history is persisted for replay and future user-auth integration

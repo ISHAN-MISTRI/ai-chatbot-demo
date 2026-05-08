@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from io import BytesIO
 from typing import Dict, List
 
@@ -24,6 +25,48 @@ UNKNOWN_METADATA = {
     "quarter": "UNKNOWN",
     "fiscal_year": "UNKNOWN",
 }
+
+
+def _clean_upper_alnum(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (value or "").upper())
+
+
+def _infer_quarter_from_text(raw_text: str) -> str:
+    if not raw_text:
+        return "UNKNOWN"
+    match = re.search(r"\bQ([1-4])\s*[- ]?\s*FY\s*([0-9]{2,4})\b", raw_text, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"\b([1-4])Q\s*[- ]?\s*FY\s*([0-9]{2,4})\b", raw_text, flags=re.IGNORECASE)
+    if not match:
+        return "UNKNOWN"
+    quarter = match.group(1)
+    year = match.group(2)[-2:]
+    return f"Q{quarter}FY{year}"
+
+
+def _infer_ticker_from_filename(original_filename: str) -> str:
+    stem = os.path.splitext(os.path.basename(original_filename or ""))[0]
+    if not stem:
+        return "UNKNOWN"
+    parts = re.split(r"[_\-\s]+", stem)
+    for part in parts:
+        token = _clean_upper_alnum(part)
+        if 2 <= len(token) <= 12 and not token.startswith("Q") and "FY" not in token:
+            return token
+    return "UNKNOWN"
+
+
+def _apply_metadata_fallbacks(metadata: Dict[str, str], first_3_pages_text: str, original_filename: str) -> Dict[str, str]:
+    text = first_3_pages_text or ""
+    normalized_text = f"{text}\n{original_filename}"
+    if metadata.get("quarter", "UNKNOWN") == "UNKNOWN":
+        metadata["quarter"] = _infer_quarter_from_text(normalized_text)
+    if metadata.get("fiscal_year", "UNKNOWN") == "UNKNOWN" and metadata.get("quarter", "UNKNOWN") != "UNKNOWN":
+        metadata["fiscal_year"] = metadata["quarter"][-4:]
+    if metadata.get("company_ticker", "UNKNOWN") == "UNKNOWN":
+        metadata["company_ticker"] = _infer_ticker_from_filename(original_filename)
+    metadata["company_ticker"] = _clean_upper_alnum(metadata.get("company_ticker", "UNKNOWN")) or "UNKNOWN"
+    return metadata
 
 
 def _openai_client() -> OpenAI:
@@ -65,7 +108,6 @@ PDF text: {first_3_pages_text}
     for key, default_value in UNKNOWN_METADATA.items():
         value = parsed.get(key) if isinstance(parsed, dict) else None
         metadata[key] = str(value).strip() if value else default_value
-    metadata["company_ticker"] = metadata["company_ticker"].upper()
     return metadata
 
 
@@ -95,7 +137,7 @@ def _embed_text_batch(client: OpenAI, texts: List[str]) -> List[List[float]]:
 
 
 def ingest_pdf(file_bytes: bytes, original_filename: str):
-    mongo_client, db = get_database()
+    _, db = get_database()
     fs = get_gridfs(db)
     openai_client = _openai_client()
     encoding = tiktoken.get_encoding("cl100k_base")
@@ -118,9 +160,19 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
             for page in pdf.pages:
                 page_texts.append((page.extract_text() or "").strip())
 
-        metadata = extract_metadata_from_pdf("\n\n".join(page_texts[:3]))
+        first_3_pages_text = "\n\n".join(page_texts[:3])
+        metadata = extract_metadata_from_pdf(first_3_pages_text)
+        metadata = _apply_metadata_fallbacks(metadata, first_3_pages_text, original_filename)
 
-        report_file_id = db.report_files.insert_one(
+        previous_report = db.reports.find_one(
+            {"company_ticker": metadata["company_ticker"], "quarter": metadata["quarter"]},
+            {"_id": 1},
+        )
+        if previous_report:
+            db.extracted_json.delete_many({"report_id": previous_report["_id"]})
+            db.embeddings.delete_many({"report_id": previous_report["_id"]})
+            db.reports.delete_one({"_id": previous_report["_id"]})
+        report_file_id = db.reports.insert_one(
             {
                 "company_ticker": metadata["company_ticker"],
                 "company_name": metadata["company_name"],
@@ -164,10 +216,40 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
             embeddings = _embed_text_batch(openai_client, texts)
             for c, emb in zip(batch, embeddings):
                 c["embedding"] = emb
-            db.report_chunks.insert_many(batch)
+            chunk_docs = []
+            embedding_docs = []
+            for c, emb in zip(batch, embeddings):
+                chunk_id = f"{str(report_file_id)}:{c['page_number']}:{c['chunk_index']}"
+                chunk_docs.append(
+                    {
+                        "report_id": report_file_id,
+                        "chunk_id": chunk_id,
+                        "company_ticker": c["company_ticker"],
+                        "quarter": c["quarter"],
+                        "page_number": c["page_number"],
+                        "chunk_text": c["chunk_text"],
+                        "source_filename": original_filename,
+                        "created_at": utc_now(),
+                    }
+                )
+                embedding_docs.append(
+                    {
+                        "report_id": report_file_id,
+                        "chunk_id": chunk_id,
+                        "company_ticker": c["company_ticker"],
+                        "quarter": c["quarter"],
+                        "page_number": c["page_number"],
+                        "chunk_text": c["chunk_text"],
+                        "embedding": emb,
+                        "created_at": utc_now(),
+                    }
+                )
+            if chunk_docs:
+                db.extracted_json.insert_many(chunk_docs)
+                db.embeddings.insert_many(embedding_docs)
             total_chunks += len(batch)
 
-        db.report_files.update_one(
+        db.reports.update_one(
             {"_id": report_file_id},
             {
                 "$set": {
@@ -187,10 +269,8 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
         }
     except Exception:
         if report_file_id:
-            db.report_files.update_one(
+            db.reports.update_one(
                 {"_id": report_file_id},
                 {"$set": {"status": "failed", "total_pages": total_pages, "total_chunks": total_chunks}},
             )
         raise
-    finally:
-        mongo_client.close()

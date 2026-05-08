@@ -13,3 +13,4 @@ requests==2.33.1
 tqdm==4.67.3
 python-multipart==0.0.20
 numpy==2.2.3
+pymongo==4.8.0

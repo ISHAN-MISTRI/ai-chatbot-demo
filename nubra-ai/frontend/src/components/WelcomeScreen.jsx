@@ -32,7 +32,7 @@ export default function WelcomeScreen({ username, onQuickPrompt, onOpenUpload })
         Hello, {username}
       </div>
       <div className="mb-8 text-center text-[15px] text-slate-600">
-        <span className="font-semibold text-slate-900">Nubra AI</span>
+        <span className="font-semibold text-slate-900">SIHL</span>
         <span className="mx-2 rounded-full bg-blue-600 px-2 py-0.5 text-[10px] font-semibold uppercase text-white">
           Beta
         </span>
