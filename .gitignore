@@ -1,0 +1,6 @@
+.venv
+.env
+.venv_new
+.venv-1
+__pycache__/
+*/pdfs/
