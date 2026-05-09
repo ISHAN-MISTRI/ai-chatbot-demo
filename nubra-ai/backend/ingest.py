@@ -18,6 +18,7 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 METADATA_MODEL = "gpt-4o"  # Use gpt-4o for reliable JSON extraction
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "48"))
 
 UNKNOWN_METADATA = {
     "company_ticker": "UNKNOWN",
@@ -226,13 +227,18 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
             metadata={"original_filename": original_filename},
         )
 
-        page_texts = []
+        # Memory-safe extraction: only keep first 3 pages for metadata, then stream the rest.
+        first_pages_texts: list[str] = []
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
             total_pages = len(pdf.pages)
-            for page in pdf.pages:
-                page_texts.append((page.extract_text() or "").strip())
+            for idx, page in enumerate(pdf.pages):
+                text = (page.extract_text() or "").strip()
+                if idx < 3:
+                    first_pages_texts.append(text)
+                else:
+                    break
 
-        first_3_pages_text = "\n\n".join(page_texts[:3])
+        first_3_pages_text = "\n\n".join(first_pages_texts[:3])
         metadata = extract_metadata_from_pdf(first_3_pages_text)
         metadata = _apply_metadata_fallbacks(metadata, first_3_pages_text, original_filename)
 
@@ -261,46 +267,27 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
             }
         ).inserted_id
 
-        all_chunks = []
-        for page_number, page_text in enumerate(page_texts, start=1):
-            if not page_text:
-                continue
+        # Stream chunking + embedding in small batches to stay within 512MB memory.
+        pending_texts: list[str] = []
+        pending_meta: list[dict] = []
 
-            chunks = _chunk_text(page_text, encoding)
-            for chunk_index, chunk_text in enumerate(chunks):
-                all_chunks.append({
-                    "company_ticker": metadata["company_ticker"],
-                    "company_name": metadata["company_name"],
-                    "report_type": metadata["report_type"],
-                    "quarter": metadata["quarter"],
-                    "fiscal_year": metadata["fiscal_year"],
-                    "page_number": page_number,
-                    "chunk_index": chunk_index,
-                    "chunk_text": chunk_text,
-                    "source_filename": original_filename,
-                    "source_file_id": gridfs_file_id,
-                    "created_at": utc_now(),
-                })
-
-        batch_size = 500
-        for i in range(0, len(all_chunks), batch_size):
-            batch = all_chunks[i : i + batch_size]
-            texts = [c["chunk_text"] for c in batch]
-            embeddings = _embed_text_batch(openai_client, texts)
-            for c, emb in zip(batch, embeddings):
-                c["embedding"] = emb
+        def _flush_batch():
+            nonlocal total_chunks
+            if not pending_texts:
+                return
+            embeddings = _embed_text_batch(openai_client, pending_texts)
             chunk_docs = []
             embedding_docs = []
-            for c, emb in zip(batch, embeddings):
-                chunk_id = f"{str(report_file_id)}:{c['page_number']}:{c['chunk_index']}"
+            for m, emb in zip(pending_meta, embeddings):
+                chunk_id = f"{str(report_file_id)}:{m['page_number']}:{m['chunk_index']}"
                 chunk_docs.append(
                     {
                         "report_id": report_file_id,
                         "chunk_id": chunk_id,
-                        "company_ticker": c["company_ticker"],
-                        "quarter": c["quarter"],
-                        "page_number": c["page_number"],
-                        "chunk_text": c["chunk_text"],
+                        "company_ticker": metadata["company_ticker"],
+                        "quarter": metadata["quarter"],
+                        "page_number": m["page_number"],
+                        "chunk_text": m["chunk_text"],
                         "source_filename": original_filename,
                         "created_at": utc_now(),
                     }
@@ -309,10 +296,10 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                     {
                         "report_id": report_file_id,
                         "chunk_id": chunk_id,
-                        "company_ticker": c["company_ticker"],
-                        "quarter": c["quarter"],
-                        "page_number": c["page_number"],
-                        "chunk_text": c["chunk_text"],
+                        "company_ticker": metadata["company_ticker"],
+                        "quarter": metadata["quarter"],
+                        "page_number": m["page_number"],
+                        "chunk_text": m["chunk_text"],
                         "embedding": emb,
                         "created_at": utc_now(),
                     }
@@ -320,7 +307,29 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
             if chunk_docs:
                 db.extracted_json.insert_many(chunk_docs)
                 db.embeddings.insert_many(embedding_docs)
-            total_chunks += len(batch)
+            total_chunks += len(chunk_docs)
+            pending_texts.clear()
+            pending_meta.clear()
+
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            # Keep chunk_index increasing per page (stable, deterministic)
+            for page_number, page in enumerate(pdf.pages, start=1):
+                page_text = (page.extract_text() or "").strip()
+                if not page_text:
+                    continue
+                chunks = _chunk_text(page_text, encoding)
+                for chunk_index, chunk_text in enumerate(chunks):
+                    pending_texts.append(chunk_text)
+                    pending_meta.append(
+                        {
+                            "page_number": page_number,
+                            "chunk_index": chunk_index,
+                            "chunk_text": chunk_text,
+                        }
+                    )
+                    if len(pending_texts) >= EMBED_BATCH_SIZE:
+                        _flush_batch()
+        _flush_batch()
 
         db.reports.update_one(
             {"_id": report_file_id},

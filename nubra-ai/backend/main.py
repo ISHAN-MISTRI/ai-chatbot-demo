@@ -175,12 +175,21 @@ def _auto_ingest_pdfs_if_needed():
 @app.on_event("startup")
 async def _startup():
     ensure_indexes()
-    # Run ingestion best-effort; don't block startup forever on free tier
-    try:
-        _auto_ingest_pdfs_if_needed()
-    except Exception:
-        # Keep API up even if ingestion fails; user will see empty tickers but API still serves.
-        logger.exception("Startup ingestion crashed unexpectedly.")
+    # Critical for Render free tier:
+    # - Bind the port fast so health checks pass
+    # - Run ingestion in a background thread (best-effort)
+    auto_ingest = (os.getenv("AUTO_INGEST_ON_STARTUP", "1") or "1").strip().lower() not in {"0", "false", "no"}
+    if not auto_ingest:
+        logger.info("Startup ingestion disabled via AUTO_INGEST_ON_STARTUP=0")
+        return
+
+    def _runner():
+        try:
+            _auto_ingest_pdfs_if_needed()
+        except Exception:
+            logger.exception("Startup ingestion crashed unexpectedly.")
+
+    threading.Thread(target=_runner, name="auto-ingest", daemon=True).start()
 
 
 def openai_client() -> OpenAI:
