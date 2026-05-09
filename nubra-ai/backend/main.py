@@ -111,6 +111,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sihl-api")
 
+
+def _require_admin(request_token: str | None):
+    admin_token = (os.getenv("ADMIN_TOKEN") or "").strip()
+    if not admin_token:
+        raise HTTPException(status_code=503, detail="ADMIN_TOKEN is not configured on the server.")
+    if not request_token or request_token != admin_token:
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+
 def _cors_origins():
     raw = (os.getenv("CORS_ORIGINS") or "").strip()
     if not raw:
@@ -481,3 +489,45 @@ async def health():
     _, db = get_database()
     db.command("ping")
     return HealthResponse(status="ok", mongodb="connected", timestamp=utc_now())
+
+
+@app.post("/api/admin/purge")
+async def admin_purge(token: str | None = None, mode: str = "failed_only"):
+    """
+    Emergency endpoint for free-tier Atlas quota issues.
+    mode:
+      - failed_only: deletes only failed/processing reports and associated chunks (safe)
+      - all: deletes all reports, chunks, embeddings, and GridFS files (dangerous but resets quota fast)
+    """
+    _require_admin(token)
+    _, db = get_database()
+
+    if mode not in {"failed_only", "all"}:
+        raise HTTPException(status_code=400, detail="mode must be failed_only or all")
+
+    deleted = {"reports": 0, "embeddings": 0, "extracted_json": 0, "gridfs_files": 0, "gridfs_chunks": 0}
+
+    if mode == "failed_only":
+        cursor = db.reports.find({"status": {"$in": ["failed", "processing"]}}, {"_id": 1, "gridfs_file_id": 1})
+        report_ids = []
+        gridfs_ids = []
+        for r in cursor:
+            report_ids.append(r["_id"])
+            if r.get("gridfs_file_id"):
+                gridfs_ids.append(r["gridfs_file_id"])
+        if report_ids:
+            deleted["embeddings"] = db.embeddings.delete_many({"report_id": {"$in": report_ids}}).deleted_count
+            deleted["extracted_json"] = db.extracted_json.delete_many({"report_id": {"$in": report_ids}}).deleted_count
+            deleted["reports"] = db.reports.delete_many({"_id": {"$in": report_ids}}).deleted_count
+        if gridfs_ids:
+            deleted["gridfs_files"] = db["fs.files"].delete_many({"_id": {"$in": gridfs_ids}}).deleted_count
+            deleted["gridfs_chunks"] = db["fs.chunks"].delete_many({"files_id": {"$in": gridfs_ids}}).deleted_count
+        return {"status": "ok", "mode": mode, "deleted": deleted}
+
+    # mode == "all"
+    deleted["embeddings"] = db.embeddings.delete_many({}).deleted_count
+    deleted["extracted_json"] = db.extracted_json.delete_many({}).deleted_count
+    deleted["reports"] = db.reports.delete_many({}).deleted_count
+    deleted["gridfs_files"] = db["fs.files"].delete_many({}).deleted_count
+    deleted["gridfs_chunks"] = db["fs.chunks"].delete_many({}).deleted_count
+    return {"status": "ok", "mode": mode, "deleted": deleted}
