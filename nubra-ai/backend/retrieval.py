@@ -143,7 +143,10 @@ def retrieve_chunk_documents(query: str, company_ticker: str, quarters_list: Lis
         )
     )
     if not docs:
-        raise ValueError("No report data found. Upload relevant PDFs first.")
+        raise ValueError(
+            "No report data found for this company. "
+            "If this is production, the server may still be ingesting bundled PDFs (or ingestion failed)."
+        )
 
     # Score every doc first
     for doc in docs:

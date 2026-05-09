@@ -1,7 +1,7 @@
 # Nubra AI - Production Stock Analysis Chatbot
 
 End-to-end dynamic AI platform for stock report analysis:
-- Upload/admin-manage PDF reports
+- Preloaded PDF reports (bundled in `nubra-ai/pdfs/`) are auto-ingested on backend startup
 - Extract report content and metadata into structured JSON
 - Persist report, JSON chunks, embeddings, and chat history in MongoDB
 - Use semantic retrieval + OpenAI generation for context-rich financial answers
@@ -21,6 +21,8 @@ nubra-ai/
 ├── frontend/
 │   ├── src/pages/NubraAI.jsx
 │   └── package.json
+├── pdfs/
+│   └── *.pdf
 └── README.md
 ```
 
@@ -36,9 +38,10 @@ nubra-ai/
 
 Create `backend/.env`:
 ```env
-MONGODB_URI=mongodb://localhost:27017
+MONGODB_URI=mongodb://localhost:27017/nubra_ai
 MONGODB_DB_NAME=nubra_ai
 OPENAI_API_KEY=your_openai_api_key
+CORS_ORIGINS=http://localhost:5173
 ```
 
 Create `frontend/.env`:
@@ -91,16 +94,20 @@ npm run dev
 
 ## Deployment Guide
 
-- Frontend: deploy `frontend` on Vercel (`npm run build`)
-- Backend: deploy `backend` on Render/Railway with start command:
+- Frontend: deploy `frontend` on Vercel (`npm run build`) — this is a Vite React app (not Next.js)
+- Backend: deploy `backend` on Render with start command:
   - `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - Use managed MongoDB Atlas in production
-- Add CORS allowlist for deployed frontend URL
+- Add `CORS_ORIGINS` allowlist for your deployed frontend URL(s)
 - Configure secrets (`OPENAI_API_KEY`, `MONGODB_URI`) in provider environment settings
+
+### Production behavior (important)
+- The backend auto-ingests PDFs from `nubra-ai/pdfs/` on startup **only if MongoDB has no completed reports yet**.
+- Ingestion is idempotent via a stored `source_sha256` hash, preventing duplicates.
+- Users never upload PDFs in production; the upload UI is disabled in production builds.
 
 ## Architecture Notes
 
-- Ingestion is async via background tasks to avoid blocking uploads
 - Indexes are auto-created on startup for query speed and uniqueness
 - Embedding retrieval is semantic, dynamic, and fully DB-backed (no static responses)
 - Chat history is persisted for replay and future user-auth integration

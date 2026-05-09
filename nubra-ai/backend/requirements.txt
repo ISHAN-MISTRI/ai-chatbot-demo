@@ -1,16 +1,10 @@
 fastapi==0.115.12
 uvicorn==0.34.2
-sqlalchemy==2.0.38
-psycopg2-binary==2.9.10
 openai==1.78.1
 pydantic==2.11.4
 python-dotenv==1.1.0
-pymupdf==1.25.3
 pdfplumber==0.11.6
-pytesseract==0.3.13
 tiktoken==0.9.0
 requests==2.33.1
-tqdm==4.67.3
 python-multipart==0.0.20
-numpy==2.2.3
 pymongo==4.8.0

@@ -1,4 +1,3 @@
-import os
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
@@ -6,17 +5,22 @@ import gridfs
 from pymongo import MongoClient
 from pymongo.database import Database
 
-MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/nubra_ai")
-MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "nubra_ai")
-
 _MONGO_CLIENT: Optional[MongoClient] = None
 
 
 def get_database() -> Tuple[MongoClient, Database]:
     global _MONGO_CLIENT
     if _MONGO_CLIENT is None:
-        _MONGO_CLIENT = MongoClient(MONGODB_URI, maxPoolSize=50, minPoolSize=3)
-    return _MONGO_CLIENT, _MONGO_CLIENT[MONGODB_DB_NAME]
+        # Read env lazily at runtime (Render/Vercel provide env vars at process start).
+        # Avoid capturing defaults at import-time (which can accidentally point to localhost in production).
+        import os
+
+        mongodb_uri = os.getenv("MONGODB_URI", "").strip() or "mongodb://localhost:27017/nubra_ai"
+        mongodb_db_name = os.getenv("MONGODB_DB_NAME", "").strip() or "nubra_ai"
+        _MONGO_CLIENT = MongoClient(mongodb_uri, maxPoolSize=50, minPoolSize=1)
+        _MONGO_CLIENT._nubra_db_name = mongodb_db_name  # type: ignore[attr-defined]
+    db_name = getattr(_MONGO_CLIENT, "_nubra_db_name", None) or "nubra_ai"
+    return _MONGO_CLIENT, _MONGO_CLIENT[db_name]
 
 
 def get_gridfs(db: Database):
@@ -27,6 +31,7 @@ def ensure_indexes():
     _, db = get_database()
     db.reports.create_index([("company_ticker", 1), ("quarter", 1)], unique=True)
     db.reports.create_index("uploaded_at")
+    db.reports.create_index("source_sha256", unique=True, sparse=True)
     db.extracted_json.create_index([("report_id", 1), ("section_type", 1)])
     db.embeddings.create_index([("report_id", 1), ("chunk_id", 1)], unique=True)
     db.embeddings.create_index([("company_ticker", 1), ("quarter", 1)])

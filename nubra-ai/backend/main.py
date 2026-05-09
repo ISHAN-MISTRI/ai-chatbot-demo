@@ -1,5 +1,8 @@
 import json
 import os
+import pathlib
+import threading
+import logging
 from typing import List
 
 from dotenv import load_dotenv
@@ -8,12 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openai import OpenAI
 
+load_dotenv()
+
 from database import ensure_indexes, get_database, get_gridfs, utc_now
-from ingest import ingest_pdf
+from ingest import ingest_pdf, ingest_pdf_path
 from models import ChatRequest, ChatResponse, HealthResponse
 from retrieval import get_all_tickers_and_quarters, retrieve_chunk_documents, retrieve_relevant_chunks
-
-load_dotenv()
 
 SYSTEM_PROMPT = """
 You are an elite financial research assistant for Indian stock market investors on the SIHL platform.
@@ -101,15 +104,83 @@ STRICT RULES FOR MODE 2:
 """.strip()
 
 app = FastAPI(title="SIHL API", version="2.0.0")
-ensure_indexes()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
+logger = logging.getLogger("sihl-api")
+
+def _cors_origins():
+    raw = (os.getenv("CORS_ORIGINS") or "").strip()
+    if not raw:
+        return ["*"]
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins(),
+    allow_credentials=False,  # cannot be True with wildcard origins; keep it cookie-free
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+_startup_lock = threading.Lock()
+
+
+def _auto_ingest_pdfs_if_needed():
+    """
+    Production behavior:
+    - PDFs are bundled in repo under /pdfs (not user-uploaded).
+    - If the DB has no completed reports, ingest PDFs once.
+    - Idempotent via SHA-256 hash stored on report docs.
+    """
+    with _startup_lock:
+        _, db = get_database()
+        completed_reports = db.reports.count_documents({"status": "completed"})
+        if completed_reports > 0:
+            logger.info("Startup ingestion skipped: completed reports already exist (%s).", completed_reports)
+            return {"status": "skipped", "reason": "reports_exist", "completed_reports": completed_reports}
+
+        pdf_dir = pathlib.Path(__file__).resolve().parent.parent / "pdfs"
+        if not pdf_dir.exists():
+            logger.warning("Startup ingestion skipped: pdf dir not found: %s", pdf_dir)
+            return {"status": "skipped", "reason": "no_pdfs_dir", "pdf_dir": str(pdf_dir)}
+
+        pdf_paths = sorted([p for p in pdf_dir.glob("*.pdf") if p.is_file()])
+        if not pdf_paths:
+            logger.warning("Startup ingestion skipped: no PDFs found in %s", pdf_dir)
+            return {"status": "skipped", "reason": "no_pdfs_found", "pdf_dir": str(pdf_dir)}
+
+        logger.info("Startup ingestion: found %s PDFs in %s", len(pdf_paths), pdf_dir)
+        ingested = 0
+        skipped = 0
+        failed: list[dict] = []
+        for p in pdf_paths:
+            try:
+                result = ingest_pdf_path(str(p))
+                if result.get("skipped"):
+                    skipped += 1
+                else:
+                    ingested += 1
+            except Exception as exc:
+                failed.append({"file": p.name, "error": str(exc)})
+                logger.exception("Startup ingestion failed for %s", p.name)
+        logger.info("Startup ingestion finished: ingested=%s skipped=%s failed=%s", ingested, skipped, len(failed))
+        return {"status": "completed", "ingested": ingested, "skipped": skipped, "failed": failed}
+
+
+@app.on_event("startup")
+async def _startup():
+    ensure_indexes()
+    # Run ingestion best-effort; don't block startup forever on free tier
+    try:
+        _auto_ingest_pdfs_if_needed()
+    except Exception:
+        # Keep API up even if ingestion fails; user will see empty tickers but API still serves.
+        logger.exception("Startup ingestion crashed unexpectedly.")
 
 
 def openai_client() -> OpenAI:

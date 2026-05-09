@@ -3,8 +3,13 @@
 .venv_new
 .venv-1
 __pycache__/
-*/pdfs/
+*.pyc
 node_modules/
 nubra-ai/frontend/node_modules/
 .vite/
 dist/
+.pytest_cache/
+*.log
+*.sqlite
+.DS_Store
+Thumbs.db

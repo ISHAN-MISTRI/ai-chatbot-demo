@@ -11,6 +11,9 @@ export default function UploadModal({
   uploading,
   completed,
 }) {
+  // Production requirement: PDFs are preloaded on the backend at startup.
+  // This modal is kept for optional local/admin workflows, but should never show in production.
+  if (import.meta.env.PROD) return null;
   if (!open) return null;
 
   return (
