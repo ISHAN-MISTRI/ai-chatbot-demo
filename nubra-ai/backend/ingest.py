@@ -2,6 +2,7 @@ import json
 import os
 import re
 import hashlib
+import logging
 from io import BytesIO
 from typing import Dict, List
 
@@ -18,7 +19,12 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 METADATA_MODEL = "gpt-4o"  # Use gpt-4o for reliable JSON extraction
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
-EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "48"))
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "24"))
+# Optional safety valve for free-tier deployments processing huge PDFs.
+# 0 or missing means "no limit".
+MAX_PAGES = int(os.getenv("MAX_PAGES", "0"))
+
+logger = logging.getLogger("sihl-api.ingest")
 
 UNKNOWN_METADATA = {
     "company_ticker": "UNKNOWN",
@@ -264,18 +270,29 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                 "total_chunks": 0,
                 "uploaded_at": utc_now(),
                 "status": "processing",
+                "error": None,
+                "last_processed_page": 0,
             }
         ).inserted_id
 
         # Stream chunking + embedding in small batches to stay within 512MB memory.
         pending_texts: list[str] = []
         pending_meta: list[dict] = []
+        last_processed_page = 0
 
         def _flush_batch():
             nonlocal total_chunks
             if not pending_texts:
                 return
-            embeddings = _embed_text_batch(openai_client, pending_texts)
+            try:
+                embeddings = _embed_text_batch(openai_client, pending_texts)
+            except Exception as exc:
+                # Persist the error on the report for debugging in production.
+                db.reports.update_one(
+                    {"_id": report_file_id},
+                    {"$set": {"status": "failed", "error": f"embedding_failed: {exc}", "total_chunks": total_chunks}},
+                )
+                raise
             chunk_docs = []
             embedding_docs = []
             for m, emb in zip(pending_meta, embeddings):
@@ -310,11 +327,21 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
             total_chunks += len(chunk_docs)
             pending_texts.clear()
             pending_meta.clear()
+            # Progress checkpoint (helps long ingestions survive restarts)
+            db.reports.update_one(
+                {"_id": report_file_id},
+                {"$set": {"total_chunks": total_chunks, "last_processed_page": last_processed_page}},
+            )
 
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
             # Keep chunk_index increasing per page (stable, deterministic)
-            for page_number, page in enumerate(pdf.pages, start=1):
+            page_iter = enumerate(pdf.pages, start=1)
+            for page_number, page in page_iter:
+                if MAX_PAGES and page_number > MAX_PAGES:
+                    logger.warning("MAX_PAGES=%s reached for %s; stopping early.", MAX_PAGES, original_filename)
+                    break
                 page_text = (page.extract_text() or "").strip()
+                last_processed_page = page_number
                 if not page_text:
                     continue
                 chunks = _chunk_text(page_text, encoding)
@@ -338,6 +365,8 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                     "status": "completed",
                     "total_pages": total_pages,
                     "total_chunks": total_chunks,
+                    "error": None,
+                    "last_processed_page": last_processed_page,
                 }
             },
         )
