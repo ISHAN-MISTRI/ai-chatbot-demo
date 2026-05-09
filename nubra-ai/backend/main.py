@@ -218,6 +218,8 @@ def _serialize_report(doc):
         "total_chunks": doc.get("total_chunks", 0),
         "uploaded_at": doc.get("uploaded_at"),
         "status": doc.get("status", "unknown"),
+        "last_processed_page": doc.get("last_processed_page", 0),
+        "error": doc.get("error"),
     }
 
 
