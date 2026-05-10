@@ -37,6 +37,7 @@ def ensure_indexes():
         db.reports.create_index([("company_ticker", 1), ("quarter", 1)], unique=True)
         db.reports.create_index("uploaded_at")
         db.reports.create_index("source_sha256", unique=True, sparse=True)
+        # extracted_json is optional in production; keep index creation best-effort.
         db.extracted_json.create_index([("report_id", 1), ("section_type", 1)])
         db.embeddings.create_index([("report_id", 1), ("chunk_id", 1)], unique=True)
         db.embeddings.create_index([("company_ticker", 1), ("quarter", 1)])

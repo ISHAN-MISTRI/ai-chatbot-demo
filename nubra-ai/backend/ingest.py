@@ -199,7 +199,8 @@ def _embed_text_batch(client: OpenAI, texts: List[str]) -> List[List[float]]:
 
 def ingest_pdf(file_bytes: bytes, original_filename: str):
     _, db = get_database()
-    fs = get_gridfs(db)
+    store_pdf_in_gridfs = (os.getenv("STORE_PDF_IN_GRIDFS", "0") or "0").strip().lower() in {"1", "true", "yes"}
+    fs = get_gridfs(db) if store_pdf_in_gridfs else None
     openai_client = _openai_client()
     encoding = tiktoken.get_encoding("cl100k_base")
 
@@ -226,12 +227,15 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                 "reason": "already_ingested",
             }
 
-        gridfs_file_id = fs.put(
-            file_bytes,
-            filename=original_filename,
-            upload_date=utc_now(),
-            metadata={"original_filename": original_filename},
-        )
+        gridfs_file_id = None
+        if fs is not None:
+            # WARNING: GridFS storage will quickly exceed Atlas free-tier quota.
+            gridfs_file_id = fs.put(
+                file_bytes,
+                filename=original_filename,
+                upload_date=utc_now(),
+                metadata={"original_filename": original_filename},
+            )
 
         # Memory-safe extraction: only keep first 3 pages for metadata, then stream the rest.
         first_pages_texts: list[str] = []
@@ -322,7 +326,10 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                     }
                 )
             if chunk_docs:
-                db.extracted_json.insert_many(chunk_docs)
+                store_extracted_json = (os.getenv("STORE_EXTRACTED_JSON", "0") or "0").strip().lower() in {"1", "true", "yes"}
+                if store_extracted_json:
+                    # extracted_json duplicates chunk_text and increases DB size; keep disabled on free tier.
+                    db.extracted_json.insert_many(chunk_docs)
                 db.embeddings.insert_many(embedding_docs)
             total_chunks += len(chunk_docs)
             pending_texts.clear()
