@@ -245,8 +245,7 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                 metadata={"original_filename": original_filename},
             )
 
-        # Single-pass PDF open: capture first 3 pages for metadata, then ingest pages streaming.
-        # This avoids reopening large PDFs twice (lower memory pressure on free-tier).
+        # Single-pass PDF open: capture metadata and ingest pages in one open handle.
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
             total_pages = len(pdf.pages)
             first_pages_texts: list[str] = []
@@ -255,103 +254,116 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                     t = (pdf.pages[idx].extract_text() or "").strip()
                 except Exception:
                     t = ""
+                if MAX_PAGE_CHARS and t and len(t) > MAX_PAGE_CHARS:
+                    t = t[:MAX_PAGE_CHARS]
                 first_pages_texts.append(t)
 
             first_3_pages_text = "\n\n".join(first_pages_texts[:3])
             metadata = extract_metadata_from_pdf(first_3_pages_text)
             metadata = _apply_metadata_fallbacks(metadata, first_3_pages_text, original_filename)
 
-        previous_report = db.reports.find_one(
-            {"company_ticker": metadata["company_ticker"], "quarter": metadata["quarter"]},
-            {"_id": 1},
-        )
-        if previous_report:
-            db.extracted_json.delete_many({"report_id": previous_report["_id"]})
-            db.embeddings.delete_many({"report_id": previous_report["_id"]})
-            db.reports.delete_one({"_id": previous_report["_id"]})
-        report_file_id = db.reports.insert_one(
-            {
-                "company_ticker": metadata["company_ticker"],
-                "company_name": metadata["company_name"],
-                "report_type": metadata["report_type"],
-                "quarter": metadata["quarter"],
-                "fiscal_year": metadata["fiscal_year"],
-                "original_filename": original_filename,
-                "gridfs_file_id": gridfs_file_id,
-                "source_sha256": source_sha256,
-                "total_pages": total_pages,
-                "total_chunks": 0,
-                "uploaded_at": utc_now(),
-                "status": "processing",
-                "error": None,
-                "last_processed_page": 0,
-            }
-        ).inserted_id
+            previous_report = db.reports.find_one(
+                {"company_ticker": metadata["company_ticker"], "quarter": metadata["quarter"]},
+                {"_id": 1},
+            )
+            if previous_report:
+                db.extracted_json.delete_many({"report_id": previous_report["_id"]})
+                db.embeddings.delete_many({"report_id": previous_report["_id"]})
+                db.reports.delete_one({"_id": previous_report["_id"]})
+
+            report_file_id = db.reports.insert_one(
+                {
+                    "company_ticker": metadata["company_ticker"],
+                    "company_name": metadata["company_name"],
+                    "report_type": metadata["report_type"],
+                    "quarter": metadata["quarter"],
+                    "fiscal_year": metadata["fiscal_year"],
+                    "original_filename": original_filename,
+                    "gridfs_file_id": gridfs_file_id,
+                    "source_sha256": source_sha256,
+                    "total_pages": total_pages,
+                    "total_chunks": 0,
+                    "uploaded_at": utc_now(),
+                    "status": "processing",
+                    "error": None,
+                    "last_processed_page": 0,
+                }
+            ).inserted_id
 
             # Stream chunking + embedding in small batches to stay within 512MB memory.
-        pending_texts: list[str] = []
-        pending_meta: list[dict] = []
-        last_processed_page = 0
+            pending_texts: list[str] = []
+            pending_meta: list[dict] = []
+            last_processed_page = 0
 
-        def _flush_batch():
-            nonlocal total_chunks
-            if not pending_texts:
-                return
-            try:
-                embeddings = _embed_text_batch(openai_client, pending_texts)
-            except Exception as exc:
-                # Persist the error on the report for debugging in production.
+            def _flush_batch():
+                nonlocal total_chunks
+                if not pending_texts:
+                    return
+                try:
+                    embeddings = _embed_text_batch(openai_client, pending_texts)
+                except Exception as exc:
+                    db.reports.update_one(
+                        {"_id": report_file_id},
+                        {
+                            "$set": {
+                                "status": "failed",
+                                "error": f"embedding_failed: {exc}",
+                                "total_chunks": total_chunks,
+                                "last_processed_page": last_processed_page,
+                            }
+                        },
+                    )
+                    raise
+
+                chunk_docs = []
+                embedding_docs = []
+                for m, emb in zip(pending_meta, embeddings):
+                    chunk_id = f"{str(report_file_id)}:{m['page_number']}:{m['chunk_index']}"
+                    chunk_docs.append(
+                        {
+                            "report_id": report_file_id,
+                            "chunk_id": chunk_id,
+                            "company_ticker": metadata["company_ticker"],
+                            "quarter": metadata["quarter"],
+                            "page_number": m["page_number"],
+                            "chunk_text": m["chunk_text"],
+                            "source_filename": original_filename,
+                            "created_at": utc_now(),
+                        }
+                    )
+                    embedding_docs.append(
+                        {
+                            "report_id": report_file_id,
+                            "chunk_id": chunk_id,
+                            "company_ticker": metadata["company_ticker"],
+                            "quarter": metadata["quarter"],
+                            "page_number": m["page_number"],
+                            "chunk_text": m["chunk_text"],
+                            "embedding": emb,
+                            "created_at": utc_now(),
+                        }
+                    )
+
+                if embedding_docs:
+                    store_extracted_json = (os.getenv("STORE_EXTRACTED_JSON", "0") or "0").strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                    }
+                    if store_extracted_json and chunk_docs:
+                        db.extracted_json.insert_many(chunk_docs)
+                    db.embeddings.insert_many(embedding_docs)
+
+                total_chunks += len(embedding_docs)
+                pending_texts.clear()
+                pending_meta.clear()
                 db.reports.update_one(
                     {"_id": report_file_id},
-                    {"$set": {"status": "failed", "error": f"embedding_failed: {exc}", "total_chunks": total_chunks}},
+                    {"$set": {"total_chunks": total_chunks, "last_processed_page": last_processed_page}},
                 )
-                raise
-            chunk_docs = []
-            embedding_docs = []
-            for m, emb in zip(pending_meta, embeddings):
-                chunk_id = f"{str(report_file_id)}:{m['page_number']}:{m['chunk_index']}"
-                chunk_docs.append(
-                    {
-                        "report_id": report_file_id,
-                        "chunk_id": chunk_id,
-                        "company_ticker": metadata["company_ticker"],
-                        "quarter": metadata["quarter"],
-                        "page_number": m["page_number"],
-                        "chunk_text": m["chunk_text"],
-                        "source_filename": original_filename,
-                        "created_at": utc_now(),
-                    }
-                )
-                embedding_docs.append(
-                    {
-                        "report_id": report_file_id,
-                        "chunk_id": chunk_id,
-                        "company_ticker": metadata["company_ticker"],
-                        "quarter": metadata["quarter"],
-                        "page_number": m["page_number"],
-                        "chunk_text": m["chunk_text"],
-                        "embedding": emb,
-                        "created_at": utc_now(),
-                    }
-                )
-            if chunk_docs:
-                store_extracted_json = (os.getenv("STORE_EXTRACTED_JSON", "0") or "0").strip().lower() in {"1", "true", "yes"}
-                if store_extracted_json:
-                    # extracted_json duplicates chunk_text and increases DB size; keep disabled on free tier.
-                    db.extracted_json.insert_many(chunk_docs)
-                db.embeddings.insert_many(embedding_docs)
-            total_chunks += len(chunk_docs)
-            pending_texts.clear()
-            pending_meta.clear()
-            # Progress checkpoint (helps long ingestions survive restarts)
-            db.reports.update_one(
-                {"_id": report_file_id},
-                {"$set": {"total_chunks": total_chunks, "last_processed_page": last_processed_page}},
-            )
 
-            # Keep chunk_index increasing per page (stable, deterministic)
-            page_iter = enumerate(pdf.pages, start=1)
-            for page_number, page in page_iter:
+            # Ingest pages
+            for page_number, page in enumerate(pdf.pages, start=1):
                 if MAX_PAGES and page_number > MAX_PAGES:
                     logger.warning("MAX_PAGES=%s reached for %s; stopping early.", MAX_PAGES, original_filename)
                     break
@@ -362,15 +374,18 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                         original_filename,
                     )
                     break
+
                 try:
                     page_text = (page.extract_text() or "").strip()
                 except Exception:
                     page_text = ""
                 if MAX_PAGE_CHARS and page_text and len(page_text) > MAX_PAGE_CHARS:
                     page_text = page_text[:MAX_PAGE_CHARS]
+
                 last_processed_page = page_number
                 if not page_text:
                     continue
+
                 chunks = _chunk_text(page_text, encoding)
                 for chunk_index, chunk_text in enumerate(chunks):
                     if MAX_CHUNKS_PER_REPORT and (total_chunks + len(pending_texts)) >= MAX_CHUNKS_PER_REPORT:
@@ -385,6 +400,7 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                     )
                     if len(pending_texts) >= EMBED_BATCH_SIZE:
                         _flush_batch()
+
             _flush_batch()
 
         db.reports.update_one(
