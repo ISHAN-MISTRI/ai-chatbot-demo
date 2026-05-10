@@ -180,6 +180,24 @@ def _auto_ingest_pdfs_if_needed():
         return {"status": "completed", "ingested": ingested, "skipped": skipped, "failed": failed}
 
 
+def _start_ingest_in_background():
+    def _runner():
+        try:
+            _auto_ingest_pdfs_if_needed()
+        except Exception:
+            logger.exception("Ingestion crashed unexpectedly.")
+
+    threading.Thread(target=_runner, name="auto-ingest", daemon=True).start()
+
+
+@app.post("/api/admin/ingest")
+async def admin_ingest(token: str | None = None):
+    """Start PDF ingestion in background (free-tier safe)."""
+    _require_admin(token)
+    _start_ingest_in_background()
+    return {"status": "started"}
+
+
 @app.on_event("startup")
 async def _startup():
     ensure_indexes()
@@ -191,13 +209,7 @@ async def _startup():
         logger.info("Startup ingestion disabled via AUTO_INGEST_ON_STARTUP=0")
         return
 
-    def _runner():
-        try:
-            _auto_ingest_pdfs_if_needed()
-        except Exception:
-            logger.exception("Startup ingestion crashed unexpectedly.")
-
-    threading.Thread(target=_runner, name="auto-ingest", daemon=True).start()
+    _start_ingest_in_background()
 
 
 def openai_client() -> OpenAI:
