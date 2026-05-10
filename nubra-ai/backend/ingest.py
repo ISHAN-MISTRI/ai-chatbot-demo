@@ -17,12 +17,17 @@ load_dotenv()
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 METADATA_MODEL = "gpt-4o"  # Use gpt-4o for reliable JSON extraction
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+# Storage budgeting (Atlas free tier):
+# - Bigger chunks => fewer embeddings => far less storage
+# - Overlap increases chunks => increases storage
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "900"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "24"))
 # Optional safety valve for free-tier deployments processing huge PDFs.
 # 0 or missing means "no limit".
 MAX_PAGES = int(os.getenv("MAX_PAGES", "0"))
+# Total chunk cap per report. 0 means unlimited.
+MAX_CHUNKS_PER_REPORT = int(os.getenv("MAX_CHUNKS_PER_REPORT", "1200"))
 
 logger = logging.getLogger("sihl-api.ingest")
 
@@ -347,12 +352,21 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                 if MAX_PAGES and page_number > MAX_PAGES:
                     logger.warning("MAX_PAGES=%s reached for %s; stopping early.", MAX_PAGES, original_filename)
                     break
+                if MAX_CHUNKS_PER_REPORT and total_chunks >= MAX_CHUNKS_PER_REPORT:
+                    logger.warning(
+                        "MAX_CHUNKS_PER_REPORT=%s reached for %s; stopping early.",
+                        MAX_CHUNKS_PER_REPORT,
+                        original_filename,
+                    )
+                    break
                 page_text = (page.extract_text() or "").strip()
                 last_processed_page = page_number
                 if not page_text:
                     continue
                 chunks = _chunk_text(page_text, encoding)
                 for chunk_index, chunk_text in enumerate(chunks):
+                    if MAX_CHUNKS_PER_REPORT and (total_chunks + len(pending_texts)) >= MAX_CHUNKS_PER_REPORT:
+                        break
                     pending_texts.append(chunk_text)
                     pending_meta.append(
                         {
