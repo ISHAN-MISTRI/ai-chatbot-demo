@@ -25,7 +25,10 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "24"))
 # Optional safety valve for free-tier deployments processing huge PDFs.
 # 0 or missing means "no limit".
-MAX_PAGES = int(os.getenv("MAX_PAGES", "0"))
+MAX_PAGES = int(os.getenv("MAX_PAGES", "120"))
+# Prevent pathological pages (tables/OCR noise) from blowing up memory during tokenization.
+# 0 means "no truncation".
+MAX_PAGE_CHARS = int(os.getenv("MAX_PAGE_CHARS", "20000"))
 # Total chunk cap per report. 0 means unlimited.
 MAX_CHUNKS_PER_REPORT = int(os.getenv("MAX_CHUNKS_PER_REPORT", "1200"))
 
@@ -242,20 +245,21 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                 metadata={"original_filename": original_filename},
             )
 
-        # Memory-safe extraction: only keep first 3 pages for metadata, then stream the rest.
-        first_pages_texts: list[str] = []
+        # Single-pass PDF open: capture first 3 pages for metadata, then ingest pages streaming.
+        # This avoids reopening large PDFs twice (lower memory pressure on free-tier).
         with pdfplumber.open(BytesIO(file_bytes)) as pdf:
             total_pages = len(pdf.pages)
-            for idx, page in enumerate(pdf.pages):
-                text = (page.extract_text() or "").strip()
-                if idx < 3:
-                    first_pages_texts.append(text)
-                else:
-                    break
+            first_pages_texts: list[str] = []
+            for idx in range(min(3, total_pages)):
+                try:
+                    t = (pdf.pages[idx].extract_text() or "").strip()
+                except Exception:
+                    t = ""
+                first_pages_texts.append(t)
 
-        first_3_pages_text = "\n\n".join(first_pages_texts[:3])
-        metadata = extract_metadata_from_pdf(first_3_pages_text)
-        metadata = _apply_metadata_fallbacks(metadata, first_3_pages_text, original_filename)
+            first_3_pages_text = "\n\n".join(first_pages_texts[:3])
+            metadata = extract_metadata_from_pdf(first_3_pages_text)
+            metadata = _apply_metadata_fallbacks(metadata, first_3_pages_text, original_filename)
 
         previous_report = db.reports.find_one(
             {"company_ticker": metadata["company_ticker"], "quarter": metadata["quarter"]},
@@ -284,7 +288,7 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
             }
         ).inserted_id
 
-        # Stream chunking + embedding in small batches to stay within 512MB memory.
+            # Stream chunking + embedding in small batches to stay within 512MB memory.
         pending_texts: list[str] = []
         pending_meta: list[dict] = []
         last_processed_page = 0
@@ -345,7 +349,6 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                 {"$set": {"total_chunks": total_chunks, "last_processed_page": last_processed_page}},
             )
 
-        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
             # Keep chunk_index increasing per page (stable, deterministic)
             page_iter = enumerate(pdf.pages, start=1)
             for page_number, page in page_iter:
@@ -359,7 +362,12 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                         original_filename,
                     )
                     break
-                page_text = (page.extract_text() or "").strip()
+                try:
+                    page_text = (page.extract_text() or "").strip()
+                except Exception:
+                    page_text = ""
+                if MAX_PAGE_CHARS and page_text and len(page_text) > MAX_PAGE_CHARS:
+                    page_text = page_text[:MAX_PAGE_CHARS]
                 last_processed_page = page_number
                 if not page_text:
                     continue
@@ -377,7 +385,7 @@ def ingest_pdf(file_bytes: bytes, original_filename: str):
                     )
                     if len(pending_texts) >= EMBED_BATCH_SIZE:
                         _flush_batch()
-        _flush_batch()
+            _flush_batch()
 
         db.reports.update_one(
             {"_id": report_file_id},
