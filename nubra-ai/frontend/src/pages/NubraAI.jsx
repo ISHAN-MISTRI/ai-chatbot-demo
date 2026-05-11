@@ -51,7 +51,7 @@ export default function NubraAI() {
       `Give me a financial table for ${selectedTicker}`,
     ]
     : [
-      "Summarize earnings across all years",
+      "Summarize earnings for FY2025",
       "What are the key risks?",
       "Give me a financial performance table",
     ];
