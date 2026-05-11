@@ -46,7 +46,7 @@ export default function NubraAI() {
   // Quick prompts — dynamic based on selected ticker
   const quickPrompts = selectedTicker
     ? [
-      `Summarize ${selectedTicker} earnings across all years`,
+      `Summarize ${selectedTicker} earnings for FY2025`,
       `What are the key risks for ${selectedTicker}?`,
       `Give me a financial table for ${selectedTicker}`,
     ]
